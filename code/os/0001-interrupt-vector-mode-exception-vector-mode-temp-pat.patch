@@ -1,0 +1,313 @@
+From 83cdbd7233b8a5a49ef0f0da698226b1c0d1273e Mon Sep 17 00:00:00 2001
+From: Eric Chan <e14002270@gmail.com>
+Date: Sun, 6 Mar 2022 23:31:52 +0800
+Subject: [PATCH] interrupt vector mode && exception vector mode temp patch
+
+---
+ code/os/09-lock/entry.S | 103 +++++++++++++++++++++++++++++++++-------
+ code/os/09-lock/timer.c |   1 +
+ code/os/09-lock/trap.c  |  83 ++++++++++++++++++--------------
+ code/os/09-lock/trap.h  |  20 ++++++++
+ code/os/09-lock/user.c  |   1 +
+ 5 files changed, 156 insertions(+), 52 deletions(-)
+ create mode 100644 code/os/09-lock/trap.h
+
+diff --git a/code/os/09-lock/entry.S b/code/os/09-lock/entry.S
+index f846a2e..777ebae 100644
+--- a/code/os/09-lock/entry.S
++++ b/code/os/09-lock/entry.S
+@@ -80,14 +80,7 @@
+ # - We use mscratch to hold a pointer to context of previous task
+ # - We use t6 as the 'base' for reg_save/reg_restore, because it is the
+ #   very bottom register (x31) and would not be overwritten during loading.
+-
+-.text
+-
+-# interrupts and exceptions while in machine mode come here.
+-.globl trap_vector
+-# the trap vector base address must always be aligned on a 4-byte boundary
+-.align 4
+-trap_vector:
++.macro ISR_IN
+ 	# save context(registers).
+ 	csrrw	t6, mscratch, t6	# swap t6 and mscratch
+ 	reg_save t6
+@@ -104,21 +97,97 @@ trap_vector:
+ 
+ 	# Restore the context pointer into mscratch
+ 	csrw	mscratch, t5
++.endm
+ 
+-	# call the C trap handler in trap.c
+-	csrr	a0, mepc
+-	csrr	a1, mcause
+-	call	trap_handler
+-
+-	# trap_handler will return the return address via a0.
+-	csrw	mepc, a0
+-
++.macro ISR_OUT
+ 	# restore context(registers).
++	csrw	mepc, a0
+ 	csrr	t6, mscratch
+ 	reg_restore t6
+-
+ 	# return to whatever we were doing before trap.
+ 	mret
++.endm
++
++.text
++
++.global default_irq_handler
++.align 4
++default_irq_handler:
++    ISR_IN
++    call default_handler
++    ISR_OUT
++
++.global software_irq_handler
++.align 4
++software_irq_handler:
++    ISR_IN
++    call timer_handler
++    ISR_OUT
++
++.global timer_irq_handler
++.align 4
++timer_irq_handler:
++    ISR_IN
++    call software_interrupt_handler
++    ISR_OUT
++
++.global external_irq_handler
++.align 4
++external_irq_handler:
++    ISR_IN
++    call external_interrupt_handler
++    ISR_OUT
++
++.global vector_table
++.align 4
++vector_table:
++IRQ_0:
++    j   trap_entry
++IRQ_1:
++    j   default_handler
++IRQ_2:
++    j   default_handler
++IRQ_3:
++    j   software_irq_handler
++IRQ_4:
++    j   default_handler
++IRQ_5:
++    j   default_handler
++IRQ_6:
++    j   default_handler
++IRQ_7:
++    j   timer_irq_handler
++IRQ_8:
++    j   default_handler
++IRQ_9:
++    j   default_handler
++IRQ_10:
++    j   default_handler
++IRQ_11:
++    j   external_irq_handler
++IRQ_12:
++    j   default_handler
++IRQ_13:
++    j   default_handler
++IRQ_14:
++    j   default_handler
++IRQ_15:
++    j   default_handler
++
++# interrupts and exceptions while in machine mode come here.
++.globl trap_entry
++# the trap vector base address must always be aligned on a 4-byte boundary
++.align 4
++trap_entry:
++
++    ISR_IN
++	# call the C trap handler in trap.c
++	csrr	a0, mepc
++	csrr	a1, mcause
++    csrr    a2, mtval
++	call	trap_handler
++	# trap_handler will return the return address via a0.
++    ISR_OUT
+ 
+ # void switch_to(struct context *next);
+ # a0: pointer to the context of the next task
+diff --git a/code/os/09-lock/timer.c b/code/os/09-lock/timer.c
+index f769ee3..68f3273 100644
+--- a/code/os/09-lock/timer.c
++++ b/code/os/09-lock/timer.c
+@@ -30,6 +30,7 @@ void timer_init()
+ 
+ void timer_handler() 
+ {
++	uart_puts("timer interruption!\n");
+ 	_tick++;
+ 	printf("tick: %d\n", _tick);
+ 
+diff --git a/code/os/09-lock/trap.c b/code/os/09-lock/trap.c
+index b3fa9cc..dfc9e24 100644
+--- a/code/os/09-lock/trap.c
++++ b/code/os/09-lock/trap.c
+@@ -1,6 +1,25 @@
++#include "trap.h"
+ #include "os.h"
+ 
+-extern void trap_vector(void);
++static const char *exception_type [EXCEPTION_TYPE_NUM] = {
++    "instruction misaligned",
++    "instruction fault",
++    "illegal instruction",
++    "breakpoint",
++    "load misaligned",
++    "load fault",
++    "store/amo misaligned",
++    "store/amo fault",
++    "syscall from U mode",
++    "syscall from S mode",
++    "reserved",
++    "syscall from M mode",
++    "instruction page fault",
++    "load page fault",
++    "reserved for future",
++    "store/amo page fault"
++};
++extern void vector_table(void);
+ extern void uart_isr(void);
+ extern void timer_handler(void);
+ extern void schedule(void);
+@@ -10,13 +29,33 @@ void trap_init()
+ 	/*
+ 	 * set the trap-vector base-address for machine-mode
+ 	 */
+-	w_mtvec((reg_t)trap_vector);
++	w_mtvec((reg_t)vector_table | 0x1);
++}
++
++void default_handler(void)
++{
++    printf("default_hanlder\n");
++}
++
++void software_interrupt_handler(void)
++{
++	uart_puts("software interruption!\n");
++	/*
++	 * acknowledge the software interrupt by clearing 			 
++     * the MSIP bit in mip.
++	 */
++    int id = r_mhartid();
++    *(uint32_t*)CLINT_MSIP(id) = 0;
++
++	schedule();
++	uart_puts("software interruption exit\n");
+ }
+ 
+ void external_interrupt_handler()
+ {
+ 	int irq = plic_claim();
+ 
++    uart_puts("external interruption!\n");
+ 	if (irq == UART0_IRQ){
+       		uart_isr();
+ 	} else if (irq) {
+@@ -28,44 +67,18 @@ void external_interrupt_handler()
+ 	}
+ }
+ 
+-reg_t trap_handler(reg_t epc, reg_t cause)
++reg_t trap_handler(reg_t epc, reg_t cause, reg_t tval)
+ {
+ 	reg_t return_pc = epc;
+ 	reg_t cause_code = cause & 0xfff;
+ 	
+-	if (cause & 0x80000000) {
+-		/* Asynchronous trap - interrupt */
+-		switch (cause_code) {
+-		case 3:
+-			uart_puts("software interruption!\n");
+-			/*
+-			 * acknowledge the software interrupt by clearing
+-    			 * the MSIP bit in mip.
+-			 */
+-			int id = r_mhartid();
+-    			*(uint32_t*)CLINT_MSIP(id) = 0;
+-
+-			schedule();
+-
+-			break;
+-		case 7:
+-			uart_puts("timer interruption!\n");
+-			timer_handler();
+-			break;
+-		case 11:
+-			uart_puts("external interruption!\n");
+-			external_interrupt_handler();
+-			break;
+-		default:
+-			uart_puts("unknown async exception!\n");
+-			break;
+-		}
+-	} else {
+-		/* Synchronous trap - exception */
+-		printf("Sync exceptions!, code = %d\n", cause_code);
+-		panic("OOPS! What can I do!");
++	/* Synchronous trap - exception */
++    if (cause_code < EXCEPTION_TYPE_NUM)
++        printf("exception type: %s\n", exception_type[cause_code]);
++    printf("mepc = %p, mtval = %p\n", epc, tval);
++	printf("Sync exceptions!, code = %d\n", cause_code);
++	panic("OOPS! What can I do!");
+ 		//return_pc += 4;
+-	}
+ 
+ 	return return_pc;
+ }
+diff --git a/code/os/09-lock/trap.h b/code/os/09-lock/trap.h
+new file mode 100644
+index 0000000..0179ceb
+--- /dev/null
++++ b/code/os/09-lock/trap.h
+@@ -0,0 +1,20 @@
++#pragma once
++enum EXCEPTION_TYPE {
++    INSTRUCTION_ADDRESS_MISALIGNED  = 0,
++    INSTRUCTION_ACCESS_FAULT        = 1,
++    ILLEGAL_INSTRUCTION             = 2,
++    BREAKPOINT                      = 3,
++    LOAD_ADDRESS_MISALIGNED         = 4,
++    LOAD_ACCESS_FAULT               = 5,
++    STORE_AMO_ADDRESS_MISALIGN      = 6,
++    STORE_AMO_ACCESS_FAULT          = 7,
++    ECALL_FROM_U_MODE               = 8,
++    ECALL_FROM_S_MODE               = 9,
++    RESERVED                        = 10,
++    ECALL_FROM_M_MODE               = 11,
++    INSTRUCTION_PAGE_FAULT          = 12,
++    LOAD_PAGE_FAULT                 = 13,
++    RESERVED_FOR_FUTURE             = 14,
++    STORE_AMO_PAGE_FAULT            = 15,
++    EXCEPTION_TYPE_NUM              = 16,
++};
+\ No newline at end of file
+diff --git a/code/os/09-lock/user.c b/code/os/09-lock/user.c
+index a56ed25..d4bc69c 100644
+--- a/code/os/09-lock/user.c
++++ b/code/os/09-lock/user.c
+@@ -28,6 +28,7 @@ void user_task1(void)
+ 	uart_puts("Task 1: Created!\n");
+ 	while (1) {
+ 		uart_puts("Task 1: Begin ... \n");
++        trap_test();
+ 		for (int i = 0; i < 5; i++) {
+ 			uart_puts("Task 1: Running... \n");
+ 			task_delay(DELAY);
+-- 
+2.25.1
+

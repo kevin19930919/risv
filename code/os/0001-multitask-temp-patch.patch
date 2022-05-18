@@ -1,0 +1,147 @@
+From ee7a6e34d98445842e85e8f0fb29aa2e8f841626 Mon Sep 17 00:00:00 2001
+From: Eric Chan <e14002270@gmail.com>
+Date: Thu, 10 Feb 2022 22:41:53 +0800
+Subject: [PATCH] multitask temp patch
+
+---
+ code/os/02-memanagement/kernel.c   |  2 +-
+ code/os/02-memanagement/printf.c   |  8 ++++++++
+ code/os/02-memanagement/spinlock.c | 32 ++++++++++++++++++++++++++++++
+ code/os/02-memanagement/spinlock.h | 19 ++++++++++++++++++
+ code/os/02-memanagement/start.S    |  2 +-
+ 5 files changed, 61 insertions(+), 2 deletions(-)
+ create mode 100644 code/os/02-memanagement/spinlock.c
+ create mode 100644 code/os/02-memanagement/spinlock.h
+
+diff --git a/code/os/02-memanagement/kernel.c b/code/os/02-memanagement/kernel.c
+index 1a99e4c..b648a48 100644
+--- a/code/os/02-memanagement/kernel.c
++++ b/code/os/02-memanagement/kernel.c
+@@ -10,7 +10,7 @@ extern void page_init(void);
+ void start_kernel(void)
+ {
+ 	uart_init();
+-	uart_puts("Hello, RVOS!\n");
++	printf("Hello, RVOS!\n");
+ 
+ 	page_init();
+ 
+diff --git a/code/os/02-memanagement/printf.c b/code/os/02-memanagement/printf.c
+index 93ace5b..6c3d210 100644
+--- a/code/os/02-memanagement/printf.c
++++ b/code/os/02-memanagement/printf.c
+@@ -1,4 +1,5 @@
+ #include "os.h"
++#include "spinlock.h"
+ 
+ /*
+  * ref: https://github.com/cccriscv/mini-riscv-os/blob/master/05-Preemptive/lib.c
+@@ -9,6 +10,7 @@ static int _vsnprintf(char * out, size_t n, const char* s, va_list vl)
+ 	int format = 0;
+ 	int longarg = 0;
+ 	size_t pos = 0;
++
+ 	for (; *s; s++) {
+ 		if (format) {
+ 			switch(*s) {
+@@ -119,13 +121,19 @@ static int _vprintf(const char* s, va_list vl)
+ 	return res;
+ }
+ 
++static DEFINE_SPINLOCK(print_lock);
+ int printf(const char* s, ...)
+ {
+ 	int res = 0;
++    int hartid = getHartID();
++    char buf[4] = {'[', hartid + '0', ']', 0};
+ 	va_list vl;
++    spin_lock(&print_lock);
++    uart_puts(buf);
+ 	va_start(vl, s);
+ 	res = _vprintf(s, vl);
+ 	va_end(vl);
++    spin_unlock(&print_lock);
+ 	return res;
+ }
+ 
+diff --git a/code/os/02-memanagement/spinlock.c b/code/os/02-memanagement/spinlock.c
+new file mode 100644
+index 0000000..3244248
+--- /dev/null
++++ b/code/os/02-memanagement/spinlock.c
+@@ -0,0 +1,32 @@
++#include "spinlock.h"
++
++int getHartID(void)
++{
++    int temp;
++    __asm__ __volatile__ ("csrr %0, mhartid":"=temp"(temp));
++    return temp;
++}
++
++static inline void __acquire(spinlock_t *lock)
++{
++    while (lock->lock || __sync_lock_test_and_set(&lock->lock, 1));
++    __sync_synchronize();
++    lock->cpu = getHartID();
++}
++
++static inline void __release(spinlock_t *lock)
++{
++    lock->cpu = -1;
++    __sync_synchronize();
++    lock->lock = 0;
++}
++
++void spin_lock(spinlock_t *lock)
++{
++    __acquire(lock);
++}
++
++void spin_unlock(spinlock_t *lock)
++{
++    __release(lock);
++}
+\ No newline at end of file
+diff --git a/code/os/02-memanagement/spinlock.h b/code/os/02-memanagement/spinlock.h
+new file mode 100644
+index 0000000..b33ab1d
+--- /dev/null
++++ b/code/os/02-memanagement/spinlock.h
+@@ -0,0 +1,19 @@
++#ifndef _SPINLOCK_H_
++#define _SPINLOCK_H_
++
++typedef struct spinlock {
++    int lock;    
++    int cpu;
++} spinlock_t;
++
++#define SPIN_LOCK_UNLOCKED(x)   {\
++        .lock = 0,              \
++        .cpu = -1,              \
++}
++
++#define DEFINE_SPINLOCK(x) spinlock_t x = SPIN_LOCK_UNLOCKED(x)
++
++void spin_lock(spinlock_t *lock);
++void spin_unlock(spinlock_t *lock);
++int getHartID(void);
++#endif /* _SPINLOCK_H_ */
+\ No newline at end of file
+diff --git a/code/os/02-memanagement/start.S b/code/os/02-memanagement/start.S
+index c7ad5e4..90dec29 100644
+--- a/code/os/02-memanagement/start.S
++++ b/code/os/02-memanagement/start.S
+@@ -10,7 +10,7 @@ _start:
+ 	# park harts with id != 0
+ 	csrr	t0, mhartid		# read current hart id
+ 	mv	tp, t0			# keep CPU's hartid in its tp for later usage.
+-	bnez	t0, park		# if we're not on the hart 0
++	#bnez	t0, 2f		# if we're not on the hart 0
+ 					# we park the hart
+ 
+ 	# Set all bytes in the BSS section to zero.
+-- 
+2.25.1
+

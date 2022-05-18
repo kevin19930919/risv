@@ -1,0 +1,2 @@
+1.ctx_task.sp = (reg_t)&task_stack[STACK_SIZE - 1] 這邊取1024 - 1的原因是啥 ? (shed.c line20)
+2.我看老師把switch_to用asm寫，所以通常底層常被調用的指令都是用asm寫的嗎?

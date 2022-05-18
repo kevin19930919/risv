@@ -1,0 +1,2 @@
+1.exception引發的時候，mepc是指向引發異常的指令。範例中老師為了避免一值重複執行用了死循環panic阻止。這一段跟我實際遇到場景有點對不起來，如果寫的code引發exception，沒有特別去catch這個exception的話會直接跳出程序，是因為不同上層語言抽象後導致的嗎?
+2.老師的trap_handler實作是根據cause的不同call uart_puts，實際上也是這樣嗎?@@還是這只是簡單演示一下，實際上的trap_handler做更多事情?
